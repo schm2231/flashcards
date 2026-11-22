@@ -1,6 +1,6 @@
 // Offline support: serve the app shell from cache, always go to the network for Google Sheets.
-const CACHE = 'flashcards-v1';
-const SHELL = ['./', 'index.html', 'style.css', 'app.js', 'grading.js', 'sheets.js', 'manifest.webmanifest',
+const CACHE = 'flashcards-v2';
+const SHELL = ['./', 'index.html', 'style.css', 'app.js', 'grading.js', 'sheets.js', 'srs.js', 'voice.js', 'manifest.webmanifest',
   'icons/icon.svg', 'icons/icon-192.png', 'icons/icon-512.png'];
 
 self.addEventListener('install', (e) => {
