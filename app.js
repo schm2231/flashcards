@@ -37,15 +37,8 @@
     return a;
   }
 
-  function stats(card) {
-    return progress[card.id] || { c: 0, w: 0, streak: 0, last: 0 };
-  }
-
   function record(card, correct) {
-    const s = { ...stats(card) };
-    if (correct) { s.c++; s.streak++; } else { s.w++; s.streak = 0; }
-    s.last = Date.now();
-    progress[card.id] = s;
+    progress[card.id] = SRS.review(progress[card.id], correct, Date.now());
     store.set(KEYS.progress, progress);
   }
 
@@ -81,17 +74,22 @@
   }
 
   // ---------- home ----------
-  async function refresh() {
+  const onHome = () => (history.state || {}).view === 'home';
+
+  // quiet = background refresh on app open: never interrupts a study session, keeps the saved copy on failure.
+  async function refresh(quiet) {
     const id = store.get(KEYS.sheet, null);
     if (!id) return;
     const btn = document.getElementById('refresh');
-    if (btn) { btn.disabled = true; btn.textContent = 'Loading…'; }
+    if (btn) { btn.disabled = true; btn.textContent = 'Syncing…'; }
     try {
-      library = await Sheets.loadLibrary(id);
+      const fresh = await Sheets.loadLibrary(id);
+      if (store.get(KEYS.sheet, null) !== id) return; // sheet changed while loading
+      library = fresh;
       store.set(KEYS.library, library);
-      renderHome();
+      if (!quiet || onHome()) renderHome();
     } catch (e) {
-      renderHome(e.message);
+      if (!quiet || onHome()) renderHome(quiet && library ? `Couldn't sync, showing your saved cards. (${e.message})` : e.message);
     }
   }
 
@@ -103,15 +101,19 @@
     const err = typeof errorMsg === 'string' ? errorMsg : null;
     if (!library || library.sheetId !== id) {
       $app.innerHTML = `<p class="muted center">Loading your boxes…</p>`;
-      if (!err) { refresh(); return; }
+      if (!err) { refresh(false); return; }
     }
 
     const boxes = (library && library.sheetId === id) ? library.boxes : [];
     const items = boxes.map((b, i) => {
       const s = boxStats(b);
+      const q = SRS.counts(b.cards, progress, Date.now());
+      const todo = q.due || q.fresh
+        ? `<span class="pill">${q.due} due</span><span class="pill new">${q.fresh} new</span>`
+        : `<span class="pill done">Caught up${q.nextDue ? ` · next ${SRS.describeWait(q.nextDue - Date.now())}` : ''}</span>`;
       const meta = b.error
         ? `<span class="bad">${esc(b.error)}</span>`
-        : `${b.cards.length} card${b.cards.length === 1 ? "" : "s"} · ${s.seen} studied${s.accuracy == null ? '' : ` · ${s.accuracy}% correct`}`;
+        : `<span class="pills">${todo}</span>${b.cards.length} card${b.cards.length === 1 ? '' : 's'}${s.accuracy == null ? '' : ` · ${s.accuracy}% correct overall`}`;
       return `<li><button class="box" data-i="${i}" ${b.error || !b.cards.length ? 'disabled' : ''}>
           <span class="box-name">${esc(b.name)}</span>
           ${b.description ? `<span class="box-desc">${esc(b.description)}</span>` : ''}
@@ -131,7 +133,7 @@
     $app.querySelectorAll('.box').forEach((el) => {
       el.addEventListener('click', () => go('study', { box: Number(el.dataset.i) }));
     });
-    document.getElementById('refresh').addEventListener('click', refresh);
+    document.getElementById('refresh').addEventListener('click', () => refresh(false));
   }
 
   // ---------- settings ----------
@@ -193,33 +195,21 @@
   // ---------- study ----------
   let session = null;
 
-  function pickCards(box, size) {
-    // Until spaced repetition lands: unseen and weakest cards first, random among equals.
-    const scored = shuffle(box.cards.slice()).map((card) => {
-      const s = stats(card);
-      const total = s.c + s.w;
-      const score = total === 0 ? -1 : s.c / total + Math.min(s.streak, 5) * 0.05;
-      return { card, score };
-    });
-    scored.sort((a, b) => a.score - b.score);
-    const chosen = (size ? scored.slice(0, size) : scored).map((x) => x.card);
-    return shuffle(chosen);
+  function newSession(box) {
+    const { cards, ahead } = SRS.pick(box.cards, progress, store.get(KEYS.sessionSize, 20), Date.now());
+    session = { box, queue: shuffle(cards), idx: 0, results: [], ahead, practice: false };
+    renderCard();
   }
 
   function renderStudyStart(data) {
     const box = library && library.boxes[data && data.box];
     if (!box) return go('home', null, true);
-    session = {
-      box,
-      queue: pickCards(box, store.get(KEYS.sessionSize, 20)),
-      idx: 0,
-      results: [],
-    };
-    renderCard();
+    newSession(box);
   }
 
-  function startWith(cards) {
-    session = { box: session.box, queue: shuffle(cards.slice()), idx: 0, results: [] };
+  // Practice rounds (re-studying misses) don't touch spaced repetition or the counts.
+  function startPractice(cards) {
+    session = { box: session.box, queue: shuffle(cards.slice()), idx: 0, results: [], ahead: false, practice: true };
     renderCard();
   }
 
@@ -232,7 +222,7 @@
 
     $app.innerHTML = `
       <div class="progress"><div style="width:${(100 * idx) / queue.length}%"></div></div>
-      <p class="muted small">${idx + 1} of ${queue.length}</p>
+      <p class="muted small">${idx + 1} of ${queue.length}${session.practice ? ' · practice, not scored' : session.ahead ? ' · nothing due, reviewing ahead' : ''}</p>
       <div class="card">
         <div class="prompt">${esc(card.prompt)}</div>
         ${card.hint ? `<button id="hint-btn" class="link">Show hint</button><div id="hint" class="hint" hidden>${esc(card.hint)}</div>` : ''}
@@ -242,8 +232,12 @@
         <button id="reveal" class="primary">Show answer</button>
       ` : `
         <form id="answer-form" class="stack">
-          <input id="answer" type="text" autocomplete="off" autocorrect="off" autocapitalize="off" spellcheck="false"
-            lang="${esc(box.lang)}" enterkeyhint="done" placeholder="Type your answer" aria-label="Your answer">
+          <div class="answer-row">
+            <input id="answer" type="text" autocomplete="off" autocorrect="off" autocapitalize="off" spellcheck="false"
+              lang="${esc(box.lang)}" enterkeyhint="done" placeholder="${Voice.supported ? 'Type or tap the mic' : 'Type your answer'}" aria-label="Your answer">
+            ${Voice.supported ? '<button type="button" id="mic" class="mic" aria-label="Speak your answer">&#127908;</button>' : ''}
+          </div>
+          <p id="voice-status" class="muted small" hidden></p>
           <button type="submit" class="primary">Check</button>
           <button type="button" id="dunno" class="secondary">I don't know</button>
         </form>
@@ -260,7 +254,9 @@
       document.getElementById('reveal').addEventListener('click', () => showSelfGrade(card));
     } else {
       const input = document.getElementById('answer');
-      input.focus();
+      if (!Voice.supported) input.focus();
+      const mic = document.getElementById('mic');
+      if (mic) mic.addEventListener('click', () => listenFor(card, box.lang, input, mic));
       document.getElementById('answer-form').addEventListener('submit', (e) => {
         e.preventDefault();
         showResult(card, input.value, Grading.grade(input.value, [card.answer, ...card.alts]));
@@ -268,6 +264,28 @@
       document.getElementById('dunno').addEventListener('click', () => {
         showResult(card, '', { correct: false, kind: 'empty', matched: card.answer });
       });
+    }
+  }
+
+  async function listenFor(card, lang, input, mic) {
+    const status = document.getElementById('voice-status');
+    if (Voice.active) { Voice.stop(); return; }
+    mic.classList.add('listening');
+    status.hidden = false;
+    status.textContent = 'Listening…';
+    try {
+      const heard = await Voice.listen(lang, (interim) => { input.value = interim; });
+      if (!document.body.contains(mic)) return; // moved on to another card
+      const answers = [card.answer, ...card.alts];
+      // The recognizer returns several guesses; use the first one that grades as correct.
+      const graded = heard.map((h) => ({ h, r: Grading.grade(h, answers) }));
+      const best = graded.find((g) => g.r.correct) || graded[0];
+      input.value = best.h;
+      showResult(card, best.h, best.r, true);
+    } catch (e) {
+      if (!document.body.contains(mic) || input.disabled) return; // answered by typing instead
+      mic.classList.remove('listening');
+      status.textContent = e.message;
     }
   }
 
@@ -293,7 +311,8 @@
     empty: '',
   };
 
-  function showResult(card, typed, result) {
+  function showResult(card, typed, result, spoken) {
+    Voice.stop();
     const form = document.getElementById('answer-form');
     form.querySelector('input').disabled = true;
     form.querySelectorAll('button').forEach((el) => { el.hidden = true; });
@@ -304,7 +323,7 @@
       const showAnswer = !correct || result.kind !== 'exact';
       fb.innerHTML = `
         <div class="verdict ${correct ? 'good' : 'bad'}">${correct ? 'Correct' : 'Not quite'}</div>
-        ${typed ? `<p class="small">You said: <b>${esc(typed)}</b></p>` : ''}
+        ${typed ? `<p class="small">${spoken ? 'You said' : 'You typed'}: <b>${esc(typed)}</b></p>` : ''}
         ${showAnswer ? `<div class="answer-box">${esc(card.answer)}</div>` : ''}
         ${card.alts.length && showAnswer ? `<p class="muted small">Also accepted: ${card.alts.map(esc).join(', ')}</p>` : ''}
         ${correct && NOTES[result.kind] ? `<p class="small">${NOTES[result.kind]}</p>` : ''}
@@ -321,10 +340,16 @@
   }
 
   function advance(card, correct, typed) {
-    record(card, correct);
+    if (!session.practice) record(card, correct);
     session.results.push({ card, correct, typed });
     session.idx++;
     renderCard();
+  }
+
+  function nextNote(box) {
+    const q = SRS.counts(box.cards, progress, Date.now());
+    if (q.due || q.fresh) return `<p class="muted center small">${q.due} due and ${q.fresh} new left in this box.</p>`;
+    return `<p class="muted center small">All caught up. Next review ${q.nextDue ? SRS.describeWait(q.nextDue - Date.now()) : 'whenever you like'}.</p>`;
   }
 
   function renderSummary() {
@@ -337,6 +362,7 @@
         <div class="score">${right} / ${results.length}</div>
         <p class="muted center">${results.length ? Math.round((100 * right) / results.length) : 0}% correct</p>
       </div>
+      ${session.practice ? '' : nextNote(box)}
       ${missed.length ? `
         <h2>Missed</h2>
         <ul class="missed">${missed.map((r) => `<li><span>${esc(r.card.prompt)}</span><b>${esc(r.card.answer)}</b></li>`).join('')}</ul>
@@ -344,17 +370,16 @@
       <button id="again" class="secondary">New session</button>
       <button id="home" class="secondary">Back to boxes</button>`;
     const retry = document.getElementById('retry');
-    if (retry) retry.addEventListener('click', () => startWith(missed.map((r) => r.card)));
-    document.getElementById('again').addEventListener('click', () => {
-      session = { box, queue: pickCards(box, store.get(KEYS.sessionSize, 20)), idx: 0, results: [] };
-      renderCard();
-    });
+    if (retry) retry.addEventListener('click', () => startPractice(missed.map((r) => r.card)));
+    document.getElementById('again').addEventListener('click', () => newSession(box));
     document.getElementById('home').addEventListener('click', () => history.back());
   }
 
   // ---------- boot ----------
   history.replaceState({ view: 'home' }, '');
+  const hadLibrary = !!library;
   renderHome();
+  if (hadLibrary && library.sheetId === store.get(KEYS.sheet, null) && navigator.onLine !== false) refresh(true);
 
   if ('serviceWorker' in navigator) {
     window.addEventListener('load', () => navigator.serviceWorker.register('sw.js').catch(() => {}));
